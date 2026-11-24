@@ -10,3 +10,7 @@ https://learn.microsoft.com/dotnet/core/tools/dotnet-install-script
 To download the latest stable versions of dotnet install, go to:
 - Bash (Linux/macOS): https://dot.net/v1/dotnet-install.sh 
 - PowerShell (Windows): https://dot.net/v1/dotnet-install.ps1
+
+HarmonyOS / OpenHarmony (downstream fork): see [harmonyos.md](harmonyos.md) for
+the `openharmony-arm64` RID, the bash wrapper, ELF code signing, feed and direct
+URL installs, and the workload bundle.

@@ -66,6 +66,8 @@ stages:
       clean: true
     - script: ./build.sh --test --configuration $(_BuildConfig) -bl
       displayName: Run Tests
+    - script: bash tests/ohos/test-openharmony.sh
+      displayName: Run HarmonyOS install script tests
     - task: PublishTestResults@2
       displayName: Publish Test Results
       inputs:

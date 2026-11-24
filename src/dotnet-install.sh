@@ -198,7 +198,17 @@ get_current_os_name() {
     elif [ "$uname" = "FreeBSD" ]; then
         echo "freebsd"
         return 0
+    elif [ "$uname" = "HarmonyOS" ] || [ "$uname" = "OpenHarmony" ] || [ "$uname" = "OHOS" ]; then
+        # HarmonyOS/OpenHarmony report their own uname value; the portable RID is openharmony-<arch>.
+        echo "openharmony"
+        return 0
     elif [ "$uname" = "Linux" ]; then
+        # OpenHarmony standard systems can report Linux and may not ship /etc/os-release.
+        if [ -r /etc/os-release ] && grep -qiE '^(ID|ID_LIKE)="?[^"]*(openharmony|ohos)' /etc/os-release; then
+            echo "openharmony"
+            return 0
+        fi
+
         local linux_platform_name=""
         linux_platform_name="$(get_linux_platform_name)" || true
 
@@ -307,7 +317,7 @@ get_machine_architecture() {
             return 0
             ;;
         aarch64|arm64)
-            if [ "$(getconf LONG_BIT)" -lt 64 ]; then
+            if machine_has "getconf" && [ "$(getconf LONG_BIT 2>/dev/null || echo 64)" -lt 64 ]; then
                 # This is 32-bit OS running on 64-bit CPU (for example Raspberry Pi OS)
                 echo "arm"
                 return 0
@@ -448,7 +458,7 @@ get_normalized_os() {
     local osname="$(to_lowercase "$1")"
     if [ ! -z "$osname" ]; then
         case "$osname" in
-            osx | freebsd | rhel.6 | linux-musl | linux)
+            osx | freebsd | rhel.6 | linux-musl | linux | openharmony)
                 echo "$osname"
                 return 0
                 ;;
@@ -457,8 +467,13 @@ get_normalized_os() {
                 echo "$osname"
                 return 0
                 ;;
+            harmonyos | ohos)
+                osname='openharmony'
+                echo "$osname"
+                return 0
+                ;;
             *)
-                say_err "'$user_defined_os' is not a supported value for --os option, supported values are: osx, macos, linux, linux-musl, freebsd, rhel.6. If you think this is a bug, report it at https://github.com/dotnet/install-scripts/issues."
+                say_err "'$user_defined_os' is not a supported value for --os option, supported values are: osx, macos, linux, linux-musl, freebsd, rhel.6, openharmony. If you think this is a bug, report it at https://github.com/dotnet/install-scripts/issues."
                 return 1
                 ;;
         esac
@@ -586,6 +601,259 @@ is_dotnet_package_installed() {
     else
         return 1
     fi
+}
+
+# args:
+# file - $1
+sha256_of() {
+    local file="$1"
+    if machine_has "sha256sum"; then
+        sha256sum "$file" | awk '{ print $1 }'
+    elif machine_has "shasum"; then
+        shasum -a 256 "$file" | awk '{ print $1 }'
+    elif machine_has "openssl"; then
+        openssl dgst -sha256 "$file" | sed 's/.*[ =]//'
+    else
+        say_err "No SHA-256 tool found (sha256sum, shasum or openssl)."
+        return 1
+    fi
+}
+
+# args:
+# file - $1
+# expected - $2
+# description - $3
+verify_sha256() {
+    eval $invocation
+
+    local file="$1"
+    local expected="$(to_lowercase "$2")"
+    local description="$3"
+    local actual=""
+
+    actual="$(sha256_of "$file")" || return 1
+    if [ "$actual" != "$expected" ]; then
+        say_err "SHA-256 mismatch for $description."
+        say_err "  expected: $expected"
+        say_err "  actual:   $actual"
+        return 1
+    fi
+    say "SHA-256 verified for $description."
+    return 0
+}
+
+# OpenHarmony/HarmonyOS execute only ELF binaries that carry a .codesign section on
+# commercial HarmonyOS. These helpers locate a signing tool and sign the installed binaries.
+
+find_selfsign_tool() {
+    if [ -x "${install_root}/selfsign" ]; then
+        echo "${install_root}/selfsign"
+        return 0
+    fi
+    if machine_has "selfsign"; then
+        command -v selfsign
+        return 0
+    fi
+    return 1
+}
+
+find_binary_sign_tool() {
+    if machine_has "binary-sign-tool"; then
+        command -v binary-sign-tool
+        return 0
+    fi
+
+    local candidate
+    for candidate in \
+        "${HOME}/.harmonybrew/bin/binary-sign-tool" \
+        "${HOME}/.harmonybrew/opt/ohos-sdk/bin/binary-sign-tool" \
+        "${HOME}/.harmonybrew/opt/ohos-sdk/toolchains/lib/binary-sign-tool" \
+        "${HOME}/.harmonybrew/Cellar/ohos-sdk/"*/toolchains/lib/binary-sign-tool \
+        "${HOME}/.harmonybrew/Cellar/ohos-sdk/"*/bin/binary-sign-tool; do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# args: file - $1
+is_elf_file() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    [ "$(od -An -N4 -tx1 "$file" 2>/dev/null | tr -d ' \n')" = "7f454c46" ]
+}
+
+# args: file - $1
+# Returns 0 when the ELF already carries a .codesign section (requires readelf).
+has_codesign_section() {
+    local file="$1"
+    if machine_has "readelf"; then
+        readelf -S "$file" 2>/dev/null | grep -q '\.codesign'
+        return $?
+    fi
+    return 1
+}
+
+# args: file - $1, tool - $2, kind - $3 (selfsign|binary-sign-tool)
+sign_elf_file() {
+    local file="$1"
+    local tool="$2"
+    local kind="$3"
+    if [ "$kind" = "selfsign" ]; then
+        "$tool" "$file" --force >/dev/null 2>&1
+    else
+        "$tool" sign -inFile "$file" -outFile "$file" -selfSign 1 >/dev/null 2>&1
+    fi
+}
+
+sign_openharmony_binaries() {
+    eval $invocation
+
+    if [ "$sign_mode" = "none" ]; then
+        say_verbose "ELF signing disabled by --sign none."
+        return 0
+    fi
+
+    if [ "$sign_mode" = "auto" ] && [ "$(uname)" != "HarmonyOS" ]; then
+        say_verbose "Skipping ELF signing: not running on HarmonyOS."
+        return 0
+    fi
+
+    local tool=""
+    local kind=""
+    if tool="$(find_selfsign_tool)"; then
+        kind="selfsign"
+    elif tool="$(find_binary_sign_tool)"; then
+        kind="binary-sign-tool"
+    fi
+
+    if [ -z "$tool" ]; then
+        if [ "$sign_mode" = "auto" ]; then
+            say_warning "No ELF signing tool found (selfsign or binary-sign-tool). HarmonyOS may refuse to execute the installed binaries."
+            return 0
+        fi
+        say_err "ELF signing requested with --sign $sign_mode but no signing tool was found."
+        return 1
+    fi
+
+    say "Signing ELF binaries with $tool."
+    local signed=0
+    local skipped=0
+    local failed=0
+    local file
+    while IFS= read -r -d '' file; do
+        if is_elf_file "$file"; then
+            # Release archives are usually pre-signed. Re-signing every file is slow, so
+            # auto mode keeps existing signatures; --sign tool forces a rewrite.
+            if [ "$sign_mode" = "auto" ] && has_codesign_section "$file"; then
+                skipped=$((skipped + 1))
+                continue
+            fi
+
+            if sign_elf_file "$file" "$tool" "$kind"; then
+                signed=$((signed + 1))
+            else
+                failed=$((failed + 1))
+            fi
+        fi
+    done < <(find "$install_root" -type f -print0 2>/dev/null)
+
+    say "Signed $signed ELF file(s); $skipped already signed."
+    if [ "$failed" -ne 0 ]; then
+        say_err "Failed to sign $failed ELF file(s)."
+        return 1
+    fi
+    return 0
+}
+
+# args: bundle path or URL - $1
+install_ohos_workload_bundle() {
+    eval $invocation
+
+    local bundle="$1"
+    local work_dir=""
+    local archive="$bundle"
+    local bundle_dir=""
+    local script_path=""
+
+    work_dir="$(mktemp -d "$temporary_file_template")" || return 1
+
+    case "$bundle" in
+        http://*|https://*)
+            if ! download "$bundle" "$work_dir/workload.tar.gz"; then
+                rm -rf "$work_dir"
+                return 1
+            fi
+            archive="$work_dir/workload.tar.gz"
+            ;;
+    esac
+
+    if [ -f "$archive" ]; then
+        if ! tar -xzf "$archive" -C "$work_dir"; then
+            say_err "Failed to extract the workload bundle: $bundle"
+            rm -rf "$work_dir"
+            return 1
+        fi
+        script_path="$(find "$work_dir" -type f -name 'install-ohos-workload.sh' 2>/dev/null | head -n 1)"
+        if [ -z "$script_path" ]; then
+            say_err "The workload bundle does not contain install-ohos-workload.sh: $bundle"
+            rm -rf "$work_dir"
+            return 1
+        fi
+        bundle_dir="$(dirname "$script_path")"
+    else
+        bundle_dir="$bundle"
+        if [ ! -f "$bundle_dir/install-ohos-workload.sh" ]; then
+            say_err "The workload bundle directory does not contain install-ohos-workload.sh: $bundle"
+            rm -rf "$work_dir"
+            return 1
+        fi
+    fi
+
+    say "Installing the OpenHarmony workload from $bundle_dir."
+    local rc=0
+    ( export DOTNET_ROOT="$install_root"; export DOTNET_INSTALL_DIR="$install_root"; sh "$bundle_dir/install-ohos-workload.sh" ) || rc=$?
+    rm -rf "$work_dir"
+    return $rc
+}
+
+persist_ohos_environment() {
+    eval $invocation
+
+    local line_root="export DOTNET_ROOT=\"$install_root\""
+    local line_path="export PATH=\"$install_root:\$PATH\""
+    local profile
+    for profile in "$HOME/.profile" "$HOME/.bashrc"; do
+        [ -f "$profile" ] || continue
+        if ! grep -qF "$line_root" "$profile" 2>/dev/null; then
+            printf '\n# Added by dotnet-install.sh (openharmony)\n%s\n%s\n' "$line_root" "$line_path" >> "$profile"
+            say "Updated $profile with DOTNET_ROOT and PATH."
+        fi
+    done
+}
+
+install_openharmony_extras() {
+    eval $invocation
+
+    if [ "$normalized_os" != "openharmony" ]; then
+        return 0
+    fi
+
+    export DOTNET_ROOT="$install_root"
+
+    sign_openharmony_binaries || return 1
+
+    if [ -n "$workload_bundle" ]; then
+        install_ohos_workload_bundle "$workload_bundle" || return 1
+    fi
+
+    if [ "$persist_env" = true ]; then
+        persist_ohos_environment
+    fi
+
+    return 0
 }
 
 # args:
@@ -1151,31 +1419,53 @@ download() {
     local out_path="${2:-}"
 
     if [[ "$remote_path" != "http"* ]]; then
-        cp "$remote_path" "$out_path"
+        # Local file or file:// URL (useful for offline and device-side installs).
+        local local_path="${remote_path#file://}"
+        if [ -n "$out_path" ]; then
+            cp "$local_path" "$out_path"
+        else
+            cat "$local_path"
+        fi
         return $?
     fi
 
-    local failed=false
-    local attempts=0
-    while [ $attempts -lt 3 ]; do
-        attempts=$((attempts+1))
-        failed=false
-        if machine_has "curl"; then
-            downloadcurl "$remote_path" "$out_path" || failed=true
-        elif machine_has "wget"; then
-            downloadwget "$remote_path" "$out_path" || failed=true
-        else
-            say_err "Missing dependency: neither curl nor wget was found."
-            exit 1
-        fi
+    # Optional mirror for GitHub release assets, which can stall on restricted networks
+    # (for example on HarmonyOS devices). Opt-in through DOTNET_INSTALL_GITHUB_PROXY.
+    local candidate_urls=()
+    if [ -n "${DOTNET_INSTALL_GITHUB_PROXY:-}" ] && [[ "$remote_path" == https://github.com/* ]]; then
+        # Prefer the mirror: direct GitHub release downloads stall on some HarmonyOS networks.
+        candidate_urls+=("${DOTNET_INSTALL_GITHUB_PROXY%/}/$remote_path")
+    fi
+    candidate_urls+=("$remote_path")
 
-        if [ "$failed" = false ] || [ $attempts -ge 3 ] || { [ -n "${http_code-}" ] && [ "${http_code}" = "404" ]; }; then
+    local failed=true
+    local url
+    for url in "${candidate_urls[@]}"; do
+        local attempts=0
+        while [ $attempts -lt 2 ]; do
+            attempts=$((attempts+1))
+            failed=false
+            if machine_has "curl"; then
+                downloadcurl "$url" "$out_path" || failed=true
+            elif machine_has "wget"; then
+                downloadwget "$url" "$out_path" || failed=true
+            else
+                say_err "Missing dependency: neither curl nor wget was found."
+                exit 1
+            fi
+
+            if [ "$failed" = false ] || { [ -n "${http_code-}" ] && [ "${http_code}" = "404" ]; }; then
+                break
+            fi
+
+            say "Download attempt #$attempts has failed for $url: ${http_code-} ${download_error_msg-}"
+            sleep $((attempts*5))
+        done
+
+        if [ "$failed" = false ]; then
             break
         fi
-
-        say "Download attempt #$attempts has failed: ${http_code-} ${download_error_msg-}"
-        say "Attempt #$((attempts+1)) will start in $((attempts*10)) seconds."
-        sleep $((attempts*10))
+        say_verbose "Download failed from $url"
     done
 
     if [ "$failed" = true ]; then
@@ -1195,7 +1485,8 @@ downloadcurl() {
     # Append feed_credential as late as possible before calling curl to avoid logging feed_credential
     # Avoid passing URI with credentials to functions: note, most of them echoing parameters of invocation in verbose output.
     local remote_path_with_credential="${remote_path}${feed_credential}"
-    local curl_options="--retry 20 --retry-delay 2 --connect-timeout 15 -sSL -f --create-dirs "
+    # Bound each attempt and abort stalled transfers so the outer retry/mirror loop can run.
+    local curl_options="--retry 20 --retry-delay 2 --connect-timeout 15 --max-time 1800 --speed-limit 1024 --speed-time 60 -sSL -f --create-dirs "
     local curl_exit_code=0;
     if [ -z "$out_path" ]; then
         curl_output=$(curl $curl_options "$remote_path_with_credential" 2>&1)
@@ -1391,6 +1682,12 @@ generate_download_links() {
 generate_akams_links() {
     local valid_aka_ms_link=true;
 
+    # aka.ms only serves the Microsoft-published RIDs; OpenHarmony builds come from a custom feed.
+    if [ "$normalized_os" = "openharmony" ]; then
+        say_verbose "Skipping aka.ms links for 'openharmony'; use --feed or --url."
+        return 0
+    fi
+
     normalized_version="$(to_lowercase "$version")"
     if [[ "$normalized_version" != "latest" ]] && [ -n "$normalized_quality" ]; then
         say_err "Quality and Version options are not allowed to be specified simultaneously. See https://learn.microsoft.com/dotnet/core/tools/dotnet-install-script#options for details."
@@ -1486,6 +1783,43 @@ generate_regular_links() {
     fi
 
     #  Check if the SDK version is already installed.
+    if [[ "$dry_run" != true ]] && is_dotnet_package_installed "$install_root" "$asset_relative_path" "$effective_version"; then
+        say "$asset_name with version '$effective_version' is already installed."
+        exit 0
+    fi
+}
+
+# Direct URL install (--url). Skips feed resolution and productVersion.txt lookups.
+generate_direct_link() {
+    eval $invocation
+
+    local filename="${direct_url##*/}"
+    local product_version=""
+    # Handles both -openharmony-<arch> and the older -ohos-<arch> asset naming, and
+    # prerelease versions such as 11.0.100-rc.1.26451.109.
+    product_version="$(echo "$filename" | sed -n 's/^\(dotnet-sdk\|dotnet-runtime\|aspnetcore-runtime\)-\(.*\)-\(openharmony\|ohos\|linux-musl\|linux\|osx\|freebsd\|rhel\.6\)-[^/]*\.tar\.gz$/\2/p')"
+    if [ -z "$product_version" ]; then
+        product_version="$(echo "$filename" | sed -n 's/^\(dotnet-sdk\|dotnet-runtime\|aspnetcore-runtime\)-\([0-9][^-]*\)-.*\.tar\.gz$/\2/p')"
+    fi
+
+    local normalized_version="$(to_lowercase "$version")"
+    if [ -z "$normalized_version" ] || [ "$normalized_version" = "latest" ]; then
+        if [ -n "$product_version" ]; then
+            version="$product_version"
+        else
+            say_err "When --url is used, --version must be specified (cannot derive it from '$filename')."
+            return 1
+        fi
+    fi
+
+    specific_version="$version"
+    effective_version="${product_version:-$version}"
+
+    download_links=("$direct_url")
+    specific_versions=("$specific_version")
+    effective_versions=("$effective_version")
+    link_types=("direct")
+
     if [[ "$dry_run" != true ]] && is_dotnet_package_installed "$install_root" "$asset_relative_path" "$effective_version"; then
         say "$asset_name with version '$effective_version' is already installed."
         exit 0
@@ -1601,6 +1935,14 @@ install_dotnet() {
         return 1
     fi
 
+    if [ -n "$expected_sha256" ]; then
+        verify_sha256 "$zip_path" "$expected_sha256" "$asset_name archive" || { rm -f "$zip_path"; return 1; }
+    elif [ -n "$direct_url" ] && [ "$allow_unverified" != true ]; then
+        say_err "Refusing to install from --url without --sha256. Pass --sha256 <hex> or --allow-unverified."
+        rm -f "$zip_path"
+        return 1
+    fi
+
     remote_file_size="$(get_remote_file_size "$download_link")"
 
     say "Extracting archive from $download_link"
@@ -1637,7 +1979,14 @@ args=("$@")
 
 local_version_file_relative_path="/.version"
 bin_folder_relative_path=""
-temporary_file_template="${TMPDIR:-/tmp}/dotnet.XXXXXXXXX"
+# /tmp is read-only inside the HarmonyOS application sandbox. Prefer a writable TMPDIR and
+# fall back to $HOME/.tmp so that mktemp never fails there.
+install_tmpdir="${TMPDIR:-/tmp}"
+if [ ! -d "$install_tmpdir" ] || [ ! -w "$install_tmpdir" ]; then
+    install_tmpdir="${HOME}/.tmp"
+    mkdir -p "$install_tmpdir"
+fi
+temporary_file_template="${install_tmpdir}/dotnet.XXXXXXXXX"
 
 channel="LTS"
 version="Latest"
@@ -1657,6 +2006,13 @@ internal=false
 override_non_versioned_files=true
 non_dynamic_parameters=""
 user_defined_os=""
+# OpenHarmony/HarmonyOS additions. Empty/unset values keep the upstream behavior.
+direct_url=""
+expected_sha256=""
+sign_mode="auto"
+workload_bundle=""
+persist_env=false
+allow_unverified=false
 
 while [ $# -ne 0 ]
 do
@@ -1690,6 +2046,34 @@ do
             shift
             user_defined_os="$1"
             ;;
+        --url|-[Uu][Rr][Ll])
+            shift
+            direct_url="$1"
+            non_dynamic_parameters+=" $name "\""$1"\"""
+            ;;
+        --sha256|-[Ss][Hh][Aa]256)
+            shift
+            expected_sha256="$1"
+            non_dynamic_parameters+=" $name "\""$1"\"""
+            ;;
+        --sign|-[Ss]ign)
+            shift
+            sign_mode="$1"
+            non_dynamic_parameters+=" $name "\""$1"\"""
+            ;;
+        --workload-bundle|-[Ww]orkload[Bb]undle)
+            shift
+            workload_bundle="$1"
+            non_dynamic_parameters+=" $name "\""$1"\"""
+            ;;
+        --persist-env|-[Pp]ersist[Ee]nv)
+            persist_env=true
+            non_dynamic_parameters+=" $name"
+            ;;
+        --allow-unverified|-[Aa]llow[Uu]nverified)
+            allow_unverified=true
+            non_dynamic_parameters+=" $name"
+            ;;
         --shared-runtime|-[Ss]hared[Rr]untime)
             say_warning "The --shared-runtime flag is obsolete and may be removed in a future version of this script. The recommended usage is to specify '--runtime dotnet'."
             if [ -z "$runtime" ]; then
@@ -1718,7 +2102,7 @@ do
             verbose=true
             non_dynamic_parameters+=" $name"
             ;;
-        --azure-feed|-[Aa]zure[Ff]eed)
+        --azure-feed|--feed|-Feed|-[Aa]zure[Ff]eed)
             shift
             azure_feed="$1"
             non_dynamic_parameters+=" $name "\""$1"\"""
@@ -1807,7 +2191,7 @@ do
             echo "      --arch,-Architecture,-Arch"
             echo "          Possible values: x64, arm, arm64, s390x, ppc64le and loongarch64"
             echo "  --os <system>                    Specifies operating system to be used when selecting the installer."
-            echo "          Overrides the OS determination approach used by the script. Supported values: osx, linux, linux-musl, freebsd, rhel.6."
+            echo "          Overrides the OS determination approach used by the script. Supported values: osx, linux, linux-musl, freebsd, rhel.6, openharmony."
             echo "          In case any other value is provided, the platform will be determined by the script based on machine configuration."
             echo "          Not supported for legacy links. Use --runtime-id to specify platform for legacy links."
             echo "          Refer to: https://aka.ms/dotnet-os-lifecycle for more information."
@@ -1823,6 +2207,15 @@ do
             echo "                                     Allows using a different storage to download SDK archives from."
             echo "  --uncached-feed,-UncachedFeed      For internal use only."
             echo "                                     Allows using a different storage to download SDK archives from."
+            echo "  --url <URL>                        Install directly from an SDK/runtime tarball URL."
+            echo "                                     Requires --version unless it can be derived from the file name."
+            echo "                                     On openharmony also requires --sha256 unless --allow-unverified is set."
+            echo "  --sha256 <HEX>                     Expected SHA-256 of the downloaded archive."
+            echo "  --sign <MODE>                      ELF code signing: auto (default), none, or tool."
+            echo "                                     auto signs only on HarmonyOS when a signing tool is found."
+            echo "  --workload-bundle <PATH|URL>       Install the OpenHarmony SDK workload from a bundle after dotnet."
+            echo "  --persist-env                      Persist DOTNET_ROOT and PATH in ~/.profile and ~/.bashrc."
+            echo "  --allow-unverified                 Allow --url installs without --sha256 (insecure)."
             echo "  --skip-non-versioned-files         Skips non-versioned files if they already exist, such as the dotnet executable."
             echo "      -SkipNonVersionedFiles"
             echo "  --jsonfile <JSONFILE>              Determines the SDK version from a user specified global.json file."
@@ -1862,10 +2255,20 @@ if [ "$internal" = true ] && [ -z "$(echo $feed_credential)" ]; then
     fi
 fi
 
+if [ "$sign_mode" != "auto" ] && [ "$sign_mode" != "none" ] && [ "$sign_mode" != "tool" ]; then
+    say_err "Unsupported value for --sign: '$sign_mode'. Valid values are: auto, none, tool."
+    exit 1
+fi
+
 check_min_reqs
 calculate_vars
-# generate_regular_links call below will 'exit' if the determined version is already installed.
-generate_download_links
+
+if [ -n "$direct_url" ]; then
+    generate_direct_link || exit 1
+else
+    # generate_regular_links call below will 'exit' if the determined version is already installed.
+    generate_download_links
+fi
 
 if [[ "$dry_run" = true ]]; then
     print_dry_run
@@ -1873,6 +2276,7 @@ if [[ "$dry_run" = true ]]; then
 fi
 
 install_dotnet
+install_openharmony_extras || exit 1
 
 bin_path="$(get_absolute_path "$(combine_paths "$install_root" "$bin_folder_relative_path")")"
 if [ "$no_path" = false ]; then
