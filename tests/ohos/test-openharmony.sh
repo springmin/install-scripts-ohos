@@ -193,6 +193,7 @@ mkdir -p "$work/wl"
 cat > "$work/wl/install-ohos-workload.sh" <<'EOF'
 #!/bin/sh
 printf '%s\n' "${DOTNET_ROOT:-}" > "$(dirname "$0")/root.txt"
+printf '%s\n' "$*" > "$(dirname "$0")/args.txt"
 EOF
 chmod +x "$work/wl/install-ohos-workload.sh"
 if output="$(run_install --url "$tarball" --sha256 "$tarball_sha" --version 11.0.100 \
@@ -201,6 +202,11 @@ if output="$(run_install --url "$tarball" --sha256 "$tarball_sha" --version 11.0
         ok "--workload-bundle runs the bundle with DOTNET_ROOT"
     else
         bad "workload bundle did not receive DOTNET_ROOT"
+    fi
+    if grep -q -- "--dotnet $work/inst-wl/dotnet" "$work/wl/args.txt" 2>/dev/null; then
+        ok "--workload-bundle pins the bundle to the install root"
+    else
+        bad "workload bundle did not receive --dotnet <install>/dotnet: $(cat "$work/wl/args.txt" 2>/dev/null)"
     fi
 else
     bad "workload bundle install failed: $output"
