@@ -250,5 +250,43 @@ else
     bad "channel install failed: $output"
 fi
 
+# 15. The versions.env wrapper installs the pinned SDK with the shared installer.
+mkdir -p "$work/pins"
+cat > "$work/pins/versions.env" <<EOF
+: "\${SDK_VERSION:=11.0.100}"
+: "\${RID:=openharmony-arm64}"
+: "\${GH_USER:=springmin}"
+: "\${SDK_TARBALL_SHA256:=$tarball_sha}"
+EOF
+if output="$(PATH="$work/shim:$PATH" SDK_TARBALL_URL="file://$work/dotnet-sdk-11.0.100-openharmony-arm64.tar.gz" \
+        INSTALL_DIR="$work/inst-pins" PERSIST_ENV=0 \
+        sh "$repo_root/src/ohos-install-from-pins.sh" --versions "$work/pins/versions.env" --sign none 2>&1)"; then
+    if [ -d "$work/inst-pins/sdk/11.0.100" ]; then
+        ok "versions.env wrapper installs the pinned SDK"
+    else
+        bad "versions.env wrapper did not extract sdk/11.0.100"
+    fi
+else
+    bad "versions.env wrapper failed: $output"
+fi
+
+# 16. The versions.env wrapper refuses an install without a pinned digest.
+cat > "$work/pins/versions-nosha.env" <<'EOF'
+: "${SDK_VERSION:=11.0.100}"
+: "${RID:=openharmony-arm64}"
+: "${GH_USER:=springmin}"
+EOF
+if output="$(PATH="$work/shim:$PATH" SDK_TARBALL_URL="file://$work/dotnet-sdk-11.0.100-openharmony-arm64.tar.gz" \
+        INSTALL_DIR="$work/inst-pins-nosha" PERSIST_ENV=0 \
+        sh "$repo_root/src/ohos-install-from-pins.sh" --versions "$work/pins/versions-nosha.env" --sign none 2>&1)"; then
+    bad "versions.env wrapper without a digest unexpectedly succeeded"
+else
+    if printf '%s' "$output" | grep -q 'SDK_TARBALL_SHA256 is not set'; then
+        ok "versions.env wrapper refuses an unpinned install"
+    else
+        bad "unexpected failure output: $output"
+    fi
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

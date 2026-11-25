@@ -136,9 +136,35 @@ The shell suite covers OS detection, `--os` aliases, direct URL installs,
 idempotency, SHA-256 enforcement, `--allow-unverified`, `--sign` validation and
 the `TMPDIR` fallback.
 
+## Using the sdk-ohos version pins
+
+`src/ohos-install-from-pins.sh` reads a `sdk-ohos` `versions.env`
+(`SDK_VERSION`, `RID`, `GH_USER`, `SDK_TARBALL_SHA256`) and delegates to the
+shared installer, so the same pins drive both installers:
+
+```sh
+sh src/ohos-install-from-pins.sh --versions ~/sdk-ohos/eng/ohos-install/versions.env
+```
+
+Optional environment: `INSTALL_DIR`, `SDK_TARBALL_URL` (mirror or `file://`),
+`WORKLOAD_BUNDLE`, `INSTALL_WORKLOAD=0`, `PERSIST_ENV=0`, `ALLOW_UNVERIFIED=1`.
+An install without `SDK_TARBALL_SHA256` is refused.
+
 ## Relationship to the sdk-ohos installer
 
 `sdk-ohos/eng/ohos-install/install-dotnet-ohos.sh` is the device installer: it
 carries version pins, the workload bundle, profile persistence and the same
 signing flow. This fork keeps `dotnet-install.sh` upstream-shaped so it can be
 used from CI and cross-build hosts, where code signing is not required.
+
+The two are converging: `ohos-install-from-pins.sh` is the thin wrapper that
+reuses the shared download, checksum, extraction, signing and workload steps.
+The sdk-ohos installer keeps its release-resolution logic for the workload
+bundle until that logic moves here.
+
+## Upstream status
+
+The detection-only change is proposed upstream as
+[dotnet/install-scripts#752](https://github.com/dotnet/install-scripts/pull/752)
+(`openharmony` OS detection, `--os` value and dry-run tests). Everything else in
+this document stays in the fork while upstream is in maintenance mode.
