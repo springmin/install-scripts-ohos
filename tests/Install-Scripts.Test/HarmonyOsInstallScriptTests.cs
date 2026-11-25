@@ -51,7 +51,7 @@ namespace Microsoft.DotNet.InstallationScript.Tests
             CommandResult result = fixture.Run(
                 "-dryrun",
                 "-version", "11.0.100",
-                "-os", osAlias,
+                "--os", osAlias,
                 "-azurefeed", "file://" + fixture.FeedPath);
 
             Assert.Equal(0, result.ExitCode);
