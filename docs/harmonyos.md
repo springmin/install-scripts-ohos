@@ -98,6 +98,21 @@ In `auto` mode, files that already carry a `.codesign` section (detected with
 `readelf`) are left untouched, because the release archives are usually
 pre-signed; re-signing thousands of files is slow.
 
+### Build outputs are a separate signing pass
+
+`--sign` covers the files this installer writes. Build/publish outputs are
+signed by the SDK task (`OpenHarmonyCodesign`), which is a different pass with
+the same algorithm. Two findings from the device validation (fixed in
+`sdk-ohos`):
+
+| Problem | Fix |
+|---|---|
+| The apphost in `Microsoft.NETCore.App.Host.openharmony-arm64` ships pre-signed; the build rewrites it, so the copied signature no longer matches and HarmonyOS rejects the output with `EPERM`. | `d313577cfe`: build/publish outputs re-sign a **stale foreign** signature; an intact publisher signature is still kept. |
+| `_EnableOpenHarmonyCodeSign` was evaluated at import time, before `AppHostRuntimeIdentifier` was resolved, so a naked `dotnet build` / `dotnet run` was never signed. | `e719b6639e`: re-evaluate the gate before `Build`/`Publish`. |
+
+GA SDKs built before those commits still need `-r openharmony-arm64` or a
+manual `selfsign <app> --force` before running build output on a device.
+
 ## Sandbox notes
 
 - `/tmp` is mounted `noexec` on HarmonyOS devices: an installed `dotnet` host
